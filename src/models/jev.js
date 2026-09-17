@@ -39,6 +39,18 @@ const UNSUPPORTED = new Set([
     '!endGoal',            // paired with !goal
 ]);
 
+/**
+ * Commands withheld for reasons other than being unexpressible.
+ *
+ * !help prints the whole command list into chat. Jev reaches for it as a
+ * fallback whenever nothing else obviously applies — it was chosen at 0.36-0.51
+ * repeatedly, clearing the query floor every time because reading help is
+ * harmless. Harmless but useless: a player who wants the command list can ask
+ * for it, and leaving it on the menu only drains probability from commands that
+ * would actually do something.
+ */
+const SUPPRESSED = new Set(['!help']);
+
 /** Parameter names that are really a quantity, whatever the command calls them. */
 const COUNT_PARAMS = new Set(['num', 'count', 'quantity', 'amount', 'levelNum', 'index', 'id']);
 /** Parameter names that are really a distance or tolerance. */
@@ -52,6 +64,37 @@ const AMOUNTS = {
     a_lot: 'A large amount — "a stack", "lots", "as much as you can".',
 };
 const AMOUNT_VALUES = { one: 1, a_few: 4, a_lot: 32 };
+
+/**
+ * How sure Jev must be before the adapter will act.
+ *
+ * With 36-42 command labels on offer, probability spreads thin and a top pick
+ * of 0.16 is close to a coin flip between several options — which is how the
+ * bot ended up collecting things nobody asked for and digging aimlessly.
+ * Below the floor it declines to act instead of running the top of a flat
+ * distribution.
+ *
+ * The bar rises with consequence. Answering "what are you carrying?" wrongly
+ * costs nothing and can be corrected by asking again; digging a shaft or
+ * throwing away an inventory cannot.
+ */
+const FLOOR = {
+    query: 0.25,          // read-only: !stats, !inventory, !nearbyBlocks
+    action: 0.40,         // changes something, but recoverable
+    consequential: 0.60,  // hard or slow to undo
+};
+
+/** Commands where being wrong is expensive: destructive, or hard to reverse. */
+const CONSEQUENTIAL = new Set([
+    '!digDown', '!attack', '!attackPlayer', '!discard', '!putInChest',
+    '!givePlayer', '!consume', '!placeHere', '!useOn', '!activate',
+    '!tradeWithVillager', '!moveAway', '!goToCoordinates',
+]);
+
+function floorFor(name, isAction) {
+    if (CONSEQUENTIAL.has(name)) return FLOOR.consequential;
+    return isAction(name) ? FLOOR.action : FLOOR.query;
+}
 
 /**
  * Materials worth naming even when none is in sight. A command like
@@ -133,6 +176,9 @@ export class Jev {
         const idx = await import('../agent/commands/index.js');
         if (typeof idx.getCommand !== 'function') throw new Error('getCommand not exported');
         this.getCommand = idx.getCommand;
+        // isAction separates world-changing commands from read-only queries,
+        // which is what the confidence floor is graded on.
+        this.isAction = typeof idx.isAction === 'function' ? idx.isAction : () => true;
         return this.getCommand;
     }
 
@@ -160,16 +206,31 @@ export class Jev {
             return 'My brain disconnected, try again.';
         }
 
+        // Debug capture of what the adapter actually receives. Skips mindcraft's
+        // own bootstrap turn ("Respond with hello world and your name"), which
+        // is not a player message and was all the first version ever caught.
+        if (process.env.JEV_DUMP) {
+            const fromPlayer = turns.some((t) => t && t.role !== 'system' &&
+                typeof t.content === 'string' && /^\w+:\s/.test(t.content.trim()));
+            if (fromPlayer) {
+                const fs = await import('fs');
+                fs.appendFileSync(process.env.JEV_DUMP,
+                    JSON.stringify({ at: new Date().toISOString(), systemMessage, turns }) + '\n');
+            }
+        }
+
         const world = parseWorld(systemMessage);
         const enabled = parseEnabledCommands(systemMessage);
         const specs = this.specsFor(enabled, getCommand);
         const request = lastUserMessage(turns);
 
-        const usable = enabled.filter((name) => specs[name] && !UNSUPPORTED.has(name) && canFormat(specs[name], world));
+        const usable = enabled.filter((name) => specs[name] && !UNSUPPORTED.has(name) && !SUPPRESSED.has(name) && canFormat(specs[name], world));
         if (!this.announced) {
             const withheld = enabled.filter((n) => UNSUPPORTED.has(n));
+            const suppressed = enabled.filter((n) => SUPPRESSED.has(n));
             console.log(`[jev] ${usable.length} commands offered as typed choices` +
-                (withheld.length ? `; ${withheld.length} withheld (need generated text): ${withheld.join(' ')}` : ''));
+                (withheld.length ? `; ${withheld.length} withheld (need generated text): ${withheld.join(' ')}` : '') +
+                (suppressed.length ? `; suppressed: ${suppressed.join(' ')}` : ''));
             this.announced = true;
         }
         if (usable.length === 0) return 'No commands are available to me right now.';
@@ -192,8 +253,22 @@ export class Jev {
         }
 
         const picked = result.answers.command.choice;
+        const confidence = result.answers.command.confidence;
+        const floor = floorFor(picked, this.isAction);
+        if (confidence < floor) {
+            // Replying without a command ends mindcraft's loop, so the bot
+            // stops rather than acting on a guess.
+            const ranked = Object.entries(result.answers.command.probabilities)
+                .sort((a, b) => b[1] - a[1]).slice(0, 3)
+                .map(([k, v]) => `${k}=${v.toFixed(2)}`).join(' ');
+            console.log(`[jev] declining: ${picked} at ${confidence.toFixed(2)} is below the ${floor} floor  [${ranked}]`);
+            return request
+                ? `I'm not sure what you want me to do about that.`
+                : 'Standing by.';
+        }
+
         const line = formatCommand(specs[picked], result.answers, world, request);
-        console.log(`[jev] ${picked} conf=${result.answers.command.confidence.toFixed(2)}` +
+        console.log(`[jev] ${picked} conf=${confidence.toFixed(2)}/${floor}` +
             ` -> ${line}  (${usable.length} options, ${result.usage.input_tokens} tok)`);
         return line;
     }
@@ -282,12 +357,45 @@ function parseEnabledCommands(systemMessage) {
     return [...found];
 }
 
+/**
+ * The last thing an actual player said.
+ *
+ * Mindcraft re-prompts after every action finishes, so the most recent turn is
+ * usually its own output ("Action output: Collected 1 oak_log."), not a
+ * request. Taking the last non-assistant turn therefore asked Jev to choose a
+ * command in reply to the bot's own log roughly every other call — which is
+ * where the aimless collecting and digging came from. Player messages are
+ * formatted "Name: text", so match that.
+ */
+const PLAYER_LINE = /^\s*([A-Za-z0-9_]{1,16}):\s+(.+)$/s;
+
 function lastUserMessage(turns) {
     for (let i = turns.length - 1; i >= 0; i--) {
         const t = turns[i];
-        if (t && t.role !== 'assistant' && typeof t.content === 'string' && t.content.trim()) return t.content;
+        if (!t || t.role === 'assistant' || typeof t.content !== 'string') continue;
+        const m = PLAYER_LINE.exec(t.content.trim());
+        if (m) return m[2].trim();
     }
     return '';
+}
+
+/**
+ * What has happened since, as events rather than as instructions: action
+ * results, pathfinding failures, the behaviour log. These are what tell the
+ * model a job is already done, or that it is stuck.
+ */
+function recentEvents(turns, limit = 6) {
+    const events = [];
+    for (let i = turns.length - 1; i >= 0 && events.length < limit; i--) {
+        const t = turns[i];
+        if (!t || typeof t.content !== 'string') continue;
+        const text = t.content.trim();
+        if (!text || PLAYER_LINE.test(text)) continue;
+        if (text.startsWith('*COMMAND DOCS') || text.includes('You can use the following commands')) continue;
+        if (t.role === 'assistant') { events.push({ bot_did: text.slice(0, 120) }); continue; }
+        events.push({ happened: text.replace(/\s+/g, ' ').slice(0, 200) });
+    }
+    return events.reverse();
 }
 
 // ---------------------------------------------------------------------------
@@ -331,10 +439,6 @@ function canFormat(spec, world) {
 // ---------------------------------------------------------------------------
 
 function buildState(world, request, turns) {
-    const recent = turns.slice(-4).map((t) => ({
-        role: t.role === 'assistant' ? 'bot' : 'other',
-        text: typeof t.content === 'string' ? t.content.slice(0, 300) : '',
-    }));
     return {
         request,
         bot: {
@@ -346,7 +450,7 @@ function buildState(world, request, turns) {
         nearby_blocks: world.blocks.slice(0, 30),
         nearby_entities: world.entities.slice(0, 15),
         nearby_players: world.players,
-        recent_messages: recent,
+        recent_events: recentEvents(turns),
     };
 }
 
@@ -385,7 +489,7 @@ function buildQuestions(usable, specs, world, request) {
         // and the agent repeated !lookAtPlayer forever.
         satisfied: noul(
             `A player said to the bot: "${request}". Looking at what the bot has already done in ` +
-            '`recent_messages` and the state it is now in, has that request been carried out completely?',
+            '`recent_events` and the state it is now in, has that request been carried out completely?',
             {
                 true: 'The request is done; there is nothing further for the bot to do about it.',
                 false: 'Some part of the request is still outstanding, or the bot has not started it.',
