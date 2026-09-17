@@ -103,6 +103,31 @@ pathfinding has failed and the bot is stuck.
 Replayed against captured prompts from a live session, this moved request
 extraction from 5/10 correct to 10/10.
 
+## Naming a player
+
+The closed set for a `player_name` argument was built from `NEARBY_ENTITIES`.
+That is wrong for the same reason building materials from nearby blocks was
+wrong: "come to me" is asked precisely when the bot is *not* beside you. Once it
+wandered out of range the entity list read `none`, every command taking a
+player_name was dropped as unformattable, and `!goToPlayer` could not be chosen
+at the exact moment it was wanted. The bot picked the least-bad leftover —
+`!searchForEntity("spruce_log", 64)` — and looped.
+
+Whoever is speaking to the bot is now always a valid target, in sight or not,
+and the option says which: *"talking to the bot but is not in sight — the bot
+would have to travel to reach them."* Replayed against the captured prompt where
+this happened, the offered set goes from 35 commands to 41 with `!goToPlayer`
+restored.
+
+The speaker is also remembered across turns. Mindcraft truncates history, so the
+turn carrying a player's message eventually scrolls out of the window; forgetting
+who spoke dropped those commands again mid-task and put the bot back into a loop.
+
+Note that mindcraft's own `!goToPlayer` resolves a live entity handle, which is
+null beyond the bot's render distance — it answers `"Could not find <name>."`
+however confidently the command was chosen. Reaching a player across the map is
+a server `view-distance` question, not something the adapter can fix.
+
 ## Declining to act
 
 With 41 commands on offer, probability spreads thin, and a top pick of 0.16 is

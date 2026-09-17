@@ -159,6 +159,11 @@ export class Jev {
         });
         this.getCommand = null;
         this.announced = false;
+        // Mindcraft truncates history, so the turn carrying a player's message
+        // eventually scrolls out of the window. Forgetting who spoke dropped
+        // every player-targeting command again mid-task, which is how the bot
+        // ended up looping !entities instead of continuing to come.
+        this.lastSpeaker = null;
     }
 
     /**
@@ -222,7 +227,16 @@ export class Jev {
         const world = parseWorld(systemMessage);
         const enabled = parseEnabledCommands(systemMessage);
         const specs = this.specsFor(enabled, getCommand);
-        const request = lastUserMessage(turns);
+        const found = lastUserMessage(turns);
+        const speaker = found.speaker || this.lastSpeaker;
+        const request = found.text;
+        if (found.speaker) this.lastSpeaker = found.speaker;
+        // Whoever is talking to the bot is a valid target whether or not they
+        // are in render distance. Building the player set from NEARBY_ENTITIES
+        // alone meant that once the bot wandered out of range, every command
+        // taking a player_name was dropped — so "come to me" could not be
+        // chosen precisely when it was needed.
+        if (speaker && !world.players.includes(speaker)) world.players.unshift(speaker);
 
         const usable = enabled.filter((name) => specs[name] && !UNSUPPORTED.has(name) && !SUPPRESSED.has(name) && canFormat(specs[name], world));
         if (!this.announced) {
@@ -333,6 +347,7 @@ function parseWorld(systemMessage) {
 
     return {
         inventory,
+        nearbyPlayers: [...players],
         blocks: [...blocks],
         entities: [...entities],
         players,
@@ -374,9 +389,9 @@ function lastUserMessage(turns) {
         const t = turns[i];
         if (!t || t.role === 'assistant' || typeof t.content !== 'string') continue;
         const m = PLAYER_LINE.exec(t.content.trim());
-        if (m) return m[2].trim();
+        if (m) return { speaker: m[1], text: m[2].trim() };
     }
-    return '';
+    return { speaker: null, text: '' };
 }
 
 /**
@@ -515,7 +530,11 @@ function buildQuestions(usable, specs, world, request) {
     }
     if (world.players.length) {
         const players = {};
-        for (const p of world.players) players[p] = `The player named ${p}.`;
+        for (const p of world.players) {
+            players[p] = world.nearbyPlayers && world.nearbyPlayers.includes(p)
+                ? `The player named ${p}, currently nearby.`
+                : `The player named ${p}, who is talking to the bot but is not in sight — the bot would have to travel to reach them.`;
+        }
         questions.player = choice(
             `Assume the command names a player. Which player does "${request}" mean? The speaker is usually the answer.`,
             players,
