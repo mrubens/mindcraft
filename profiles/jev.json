@@ -1,0 +1,12 @@
+{
+    "name": "Jev",
+
+    "model": {
+        "api": "typesafe",
+        "model": "jev-latest"
+    },
+
+    "embedding": "none",
+
+    "_comment": "Jev returns typed judgments, not text. The adapter in src/models/jev.js turns mindcraft's command list into a choice question and formats the !command(args) line itself, so no prose is ever generated. Embeddings are unavailable, so example selection falls back to word overlap; code generation (!newAction) cannot be expressed and is withheld."
+}

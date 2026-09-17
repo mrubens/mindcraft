@@ -3,7 +3,17 @@ import { WorldView } from 'prismarine-viewer/viewer/lib/worldView.js';
 import { getBufferFromStream } from 'prismarine-viewer/viewer/lib/simpleUtils.js';
 
 import THREE from 'three';
-import { createCanvas } from 'node-canvas-webgl/lib/index.js';
+// node-canvas-webgl is a native CJS module that crashes Node's ESM loader on
+// import (ERR_INTERNAL_ASSERTION on Node 20, 22 and 24 here), which took the
+// whole agent process down at startup. Jev has no vision capability at all, so
+// this fork loads it lazily: the agent starts, and the screenshot path throws a
+// clear error only if something actually asks for a picture.
+let createCanvas = null;
+async function loadCanvas() {
+    if (createCanvas) return createCanvas;
+    ({ createCanvas } = await import('node-canvas-webgl/lib/index.js'));
+    return createCanvas;
+}
 import fs from 'fs/promises';
 import { Vec3 } from 'vec3';
 import { EventEmitter } from 'events';
@@ -11,6 +21,8 @@ import { EventEmitter } from 'events';
 import worker_threads from 'worker_threads';
 global.Worker = worker_threads.Worker;
 
+
+export { loadCanvas };
 
 export class Camera extends EventEmitter {
     constructor (bot, fp) {
@@ -20,6 +32,9 @@ export class Camera extends EventEmitter {
         this.viewDistance = 12;
         this.width = 800;
         this.height = 512;
+        if (!createCanvas) {
+            throw new Error('Vision is unavailable in the Jev fork: node-canvas-webgl could not be loaded. Call loadCanvas() first if you have fixed that dependency.');
+        }
         this.canvas = createCanvas(this.width, this.height);
         this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas });
         this.viewer = new Viewer(this.renderer);
