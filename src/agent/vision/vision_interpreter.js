@@ -1,5 +1,4 @@
 import { Vec3 } from 'vec3';
-import { Camera } from "./camera.js";
 import fs from 'fs';
 
 export class VisionInterpreter {
@@ -7,14 +6,27 @@ export class VisionInterpreter {
         this.agent = agent;
         this.allow_vision = allow_vision;
         this.fp = './bots/'+agent.name+'/screenshots/';
-        if (allow_vision) {
-            this.camera = new Camera(agent.bot, this.fp);
-        }
+        this.camera = null;
+        // camera.js pulls in node-canvas-webgl, a native module that some
+        // installs cannot load. Import it only when vision is actually enabled
+        // so a broken native build cannot take down a bot that never takes
+        // screenshots.
+        this.camera_ready = allow_vision
+            ? import('./camera.js').then(({ Camera }) => {
+                this.camera = new Camera(agent.bot, this.fp);
+            }).catch((err) => {
+                console.warn('Vision camera could not be loaded, vision is unavailable:', err?.message || err);
+            })
+            : Promise.resolve();
     }
 
     async lookAtPlayer(player_name, direction) {
         if (!this.allow_vision || !this.agent.prompter.vision_model.sendVisionRequest) {
             return "Vision is disabled. Use other methods to describe the environment.";
+        }
+        await this.camera_ready;
+        if (!this.camera) {
+            return "Vision is unavailable: the camera could not be loaded.";
         }
         let result = "";
         const bot = this.agent.bot;
@@ -42,6 +54,10 @@ export class VisionInterpreter {
         if (!this.allow_vision || !this.agent.prompter.vision_model.sendVisionRequest) {
             return "Vision is disabled. Use other methods to describe the environment.";
         }
+        await this.camera_ready;
+        if (!this.camera) {
+            return "Vision is unavailable: the camera could not be loaded.";
+        }
         let result = "";
         const bot = this.agent.bot;
         await bot.lookAt(new Vec3(x, y + 2, z));
@@ -56,7 +72,7 @@ export class VisionInterpreter {
         const bot = this.agent.bot;
         const maxDistance = 128; // Maximum distance to check for blocks
         const targetBlock = bot.blockAtCursor(maxDistance);
-        
+
         if (targetBlock) {
             return `Block at center view: ${targetBlock.name} at (${targetBlock.position.x}, ${targetBlock.position.y}, ${targetBlock.position.z})`;
         } else {
@@ -78,4 +94,4 @@ export class VisionInterpreter {
             return `Error reading image: ${error.message}`;
         }
     }
-} 
+}
