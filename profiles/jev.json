@@ -1,12 +1,9 @@
 {
     "name": "Jev",
-
     "model": {
         "api": "typesafe",
         "model": "jev-latest"
     },
-
     "embedding": "none",
-
-    "_comment": "Jev returns typed judgments, not text. The adapter in src/models/jev.js turns mindcraft's command list into a choice question and formats the !command(args) line itself, so no prose is ever generated. Embeddings are unavailable, so example selection falls back to word overlap; code generation (!newAction) cannot be expressed and is withheld."
+    "_comment": "Jev returns typed judgments, not text. The adapter in src/models/jev.js turns mindcraft's command list into a choice question and formats the !command(args) line itself, so no prose is ever generated. Values the request names outright (numbers, blocks, items, players) are read in code; the model is asked only what is genuinely a judgment. Embeddings are unavailable, so example selection falls back to word overlap; commands needing free text (!newAction, !goal, !searchWiki, ...) are withheld. See JEV.md."
 }
