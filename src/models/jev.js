@@ -6,25 +6,35 @@ import { getKey } from '../utils/keys.js';
 //
 // Mindcraft's other adapters ask an LLM to *write* a line of text and then
 // regex a command out of it. Jev does not generate text at all: it returns
-// typed judgments. So this adapter inverts the arrangement. It reads the
-// command list mindcraft already declares, turns it into a closed choice
-// question, asks Jev which command to run and what its arguments should be,
-// and formats the `!command("arg", 3)` line itself.
+// typed judgments. So this adapter inverts the arrangement:
 //
-// The consequences worth knowing:
+//   1. The world arrives as data. The Jev profile's prompt carries a JSON
+//      snapshot (`$WORLD_JSON`, built by src/agent/library/world_snapshot.js)
+//      with positions, distances, counts, equipment, craftable items and the
+//      creatures nearby, rather than the prose an LLM would read. A text
+//      fallback parses the stock STATS/INVENTORY prompt when the snapshot is
+//      absent.
+//   2. Code keeps a ledger of the current task: what was asked, which commands
+//      ran and what they reported. Completion that code can check — a count
+//      collected, a question answered, "You have reached" — is decided in
+//      code; the model is asked "is this done?" only as a fallback.
+//   3. The decision is decomposed. Jev is asked the player's *intent* (move,
+//      gather, make, fight, items, tell, stop, none) over a handful of options,
+//      and speculatively which command within each intent group, all in one
+//      round trip. Code reads only the winning branch.
+//   4. Obtaining an item is planned in code from the recipe registry: the model
+//      names the item, code decides whether to collect, smelt or craft next.
+//   5. Exact values stay in code. A number, a block, an item or a player the
+//      request names outright is matched against the registry or the world; the
+//      model is asked only what is genuinely a judgment.
 //
-//   * The command and every argument come back typed and bounded. The model
-//     cannot invent a command that does not exist or an item that is not in
-//     the closed set, so the malformed-call failure mode disappears.
-//   * Exact values stay in code. A number, a block, an item or a player the
-//     request names outright is read with a regex against the candidate set,
-//     not judged. The model is consulted only when the request is vague.
-//   * Commands whose arguments are genuinely free text (!newAction's code
-//     prompt, !searchWiki's query) cannot be expressed and are withheld; see
-//     UNSUPPORTED below.
-//   * The bot does not make conversation. Jev cannot write prose, so replies
-//     are the command results mindcraft prints itself.
+// Commands whose arguments are genuinely free text cannot be expressed and are
+// withheld (UNSUPPORTED). The bot does not make conversation: replies are the
+// command results mindcraft prints itself, or "Done.".
 // ---------------------------------------------------------------------------
+
+const WORLD_START = '<<JEV_WORLD>>';
+const WORLD_END = '<</JEV_WORLD>>';
 
 /**
  * Commands the adapter never offers. Most need generated text; the rest need
@@ -45,16 +55,56 @@ const UNSUPPORTED = new Set([
 ]);
 
 /**
- * Commands withheld for reasons other than being unexpressible.
- *
- * !help prints the whole command list into chat. Jev reaches for it as a
- * fallback whenever nothing else obviously applies — it was chosen at 0.36-0.51
- * repeatedly, clearing the query floor every time because reading help is
- * harmless. Harmless but useless: a player who wants the command list can ask
- * for it, and leaving it on the menu only drains probability from commands that
- * would actually do something.
+ * Commands withheld for reasons other than being unexpressible: expressible,
+ * but never what a player wants from a judgment. !help prints the command list
+ * into chat and was chosen as a harmless fallback whenever nothing else
+ * applied; !restart and !clearChat are operator actions.
  */
-const SUPPRESSED = new Set(['!help']);
+const SUPPRESSED = new Set(['!help', '!restart', '!clearChat']);
+
+/**
+ * Intent groups. The model first picks one of these (a small choice), and
+ * speculatively a command within each group that has more than one; code
+ * reads only the winning group's answer. A command may sit in two groups.
+ */
+const INTENTS = {
+    move: {
+        description: 'Go somewhere or change position: come to a player, follow someone, go to coordinates, move away, go to bed, go up to the surface, stay put, dig down, or look at something.',
+        commands: ['!goToPlayer', '!followPlayer', '!goToCoordinates', '!moveAway', '!goToBed', '!goToSurface', '!stay', '!digDown', '!lookAtPlayer', '!lookAtPosition'],
+    },
+    gather: {
+        description: 'Collect or mine blocks from the world, or go find a particular block or creature.',
+        commands: ['!collectBlocks', '!searchForBlock', '!searchForEntity'],
+    },
+    make: {
+        description: 'Obtain an item the bot does not have enough of: craft it, smelt it, or gather what it is made from.',
+        commands: ['!craftRecipe', '!smeltItem', '!clearFurnace'],
+    },
+    fight: {
+        description: 'Attack a creature or a player.',
+        commands: ['!attack', '!attackPlayer'],
+    },
+    items: {
+        description: 'Do something with items: equip, eat or drink, give to a player, drop, place a block, put into or take from a chest, activate something.',
+        commands: ['!equip', '!consume', '!givePlayer', '!discard', '!placeHere', '!putInChest', '!takeFromChest', '!viewChest', '!activate'],
+    },
+    tell: {
+        description: 'Answer a question or report information: what the bot is carrying or wearing, where it is, what is nearby, what it can craft, what a chest holds, what a villager trades.',
+        commands: ['!inventory', '!stats', '!nearbyBlocks', '!entities', '!craftable', '!viewChest', '!showVillagerTrades'],
+    },
+    stop: {
+        description: 'Stop, cancel, or end what the bot is doing; be quiet; end a conversation.',
+        commands: ['!stop', '!stfu', '!endConversation'],
+    },
+    none: {
+        description: 'No action is called for: a greeting, thanks, chit-chat, a statement about something else, or a request that has already been carried out.',
+        commands: [],
+    },
+};
+const COMMAND_GROUPS = {};
+for (const [intent, def] of Object.entries(INTENTS)) {
+    for (const name of def.commands) (COMMAND_GROUPS[name] ||= []).push(intent);
+}
 
 /** Distance-like parameters and the value used when the request names none. */
 const RANGE_DEFAULT = { closeness: 1, search_range: 64, follow_dist: 3 };
@@ -63,6 +113,8 @@ const DISTANCE_DEFAULT = { '!digDown': 4, '!moveAway': 8 };
 const DISTANCE_FALLBACK = 8;
 /** Default for !stay when the request names no number of seconds. */
 const SECONDS_DEFAULT = 30;
+/** Most blocks one !collectBlocks call is asked for when planning in code. */
+const GATHER_CAP = 64;
 
 const AMOUNTS = {
     one: 'A single one, or the message implies just one.',
@@ -72,18 +124,16 @@ const AMOUNTS = {
 const AMOUNT_VALUES = { one: 1, a_few: 4, a_lot: 32 };
 
 /**
- * How sure Jev must be before the adapter will act.
- *
- * With 30-40 command labels on offer, probability spreads thin and a top pick
- * of 0.16 is close to a coin flip between several options — which is how the
- * bot ended up collecting things nobody asked for and digging aimlessly.
- * Below the floor it declines to act instead of running the top of a flat
- * distribution.
+ * How sure Jev must be before the adapter will act. The intent floor applies
+ * to the first-stage choice; the command floors to the winning group's choice
+ * (or to the intent when the group has a single command). Both are starting
+ * points calibrated on small replay sets, not results.
  *
  * The bar rises with consequence. Answering "what are you carrying?" wrongly
  * costs nothing and can be corrected by asking again; digging a shaft or
  * throwing away an inventory cannot.
  */
+const INTENT_FLOOR = 0.35;
 const FLOOR = {
     query: 0.25,          // read-only: !stats, !inventory, !nearbyBlocks
     action: 0.40,         // changes something, but recoverable
@@ -97,7 +147,7 @@ const CONSEQUENTIAL = new Set([
     '!moveAway', '!goToCoordinates',
 ]);
 
-/** How sure the `satisfied` check must be before the adapter stops without a command. */
+/** How sure the fallback `satisfied` check must be before the adapter stops without a command. */
 const SATISFIED_THRESHOLD = 0.6;
 
 function floorFor(name, isAction) {
@@ -106,10 +156,10 @@ function floorFor(name, isAction) {
 }
 
 /**
- * Blocks worth naming even when none is in sight. A command like
- * !collectBlocks exists precisely because the thing is not already to hand, so
- * building the candidate set from nearby blocks alone made "collect 5 oak logs"
- * resolve to whatever happened to be underfoot.
+ * Blocks worth offering even when none is in sight: !collectBlocks exists
+ * precisely because the thing is not already to hand. A block the request
+ * names outright is matched against the full registry instead, so this list
+ * only shapes what the model chooses among when the request is vague.
  */
 const COMMON_BLOCKS = {
     oak_log: 'Oak logs — tree trunks, the usual source of wood.',
@@ -129,11 +179,7 @@ const COMMON_BLOCKS = {
     diamond_ore: 'Diamond ore — the valuable one, found deep.',
 };
 
-/**
- * Items worth naming even when the bot is not carrying them, for commands
- * such as !craftRecipe and !takeFromChest whose argument is something the bot
- * wants rather than something it has.
- */
+/** Items worth offering even when the bot is not carrying them and cannot craft them yet. */
 const COMMON_ITEMS = {
     oak_planks: 'Wooden planks, crafted from logs.',
     stick: 'Sticks, crafted from planks.',
@@ -150,9 +196,15 @@ const COMMON_ITEMS = {
     chest: 'A chest.',
     bread: 'Bread, food.',
     cooked_beef: 'Cooked beef, food.',
-    iron_ingot: 'Iron ingots, smelted from iron ore.',
+    iron_ingot: 'Iron ingots, smelted from raw iron.',
     coal: 'Coal, fuel.',
 };
+
+/** Creature types a player may ask the bot to go and find, whether or not any is in sight. */
+const ENTITY_TYPES = [
+    'cow', 'pig', 'sheep', 'chicken', 'rabbit', 'horse', 'donkey', 'wolf', 'cat', 'villager',
+    'zombie', 'skeleton', 'creeper', 'spider', 'enderman', 'witch', 'slime', 'drowned', 'phantom',
+];
 
 /** Words players use for blocks and items, resolved in code rather than judged. */
 const ALIASES = {
@@ -162,7 +214,8 @@ const ALIASES = {
     coal: 'coal_ore', iron: 'iron_ore', gold: 'gold_ore', copper: 'copper_ore',
     diamond: 'diamond_ore', diamonds: 'diamond_ore', grass: 'grass_block',
     pickaxe: 'wooden_pickaxe', pick: 'wooden_pickaxe', axe: 'wooden_axe', sword: 'wooden_sword',
-    table: 'crafting_table', torches: 'torch', food: 'bread',
+    table: 'crafting_table', torches: 'torch', food: 'bread', cows: 'cow', pigs: 'pig', sheeps: 'sheep',
+    chickens: 'chicken', zombies: 'zombie', skeletons: 'skeleton', creepers: 'creeper', spiders: 'spider',
 };
 
 /** Lower-cased request text with punctuation removed, padded so whole-word checks are simple. */
@@ -173,13 +226,13 @@ function normalizedWords(request) {
 /**
  * A candidate the request names outright, as a whole word or phrase, singular
  * or plural, with or without underscores. Longer names win so "dark oak logs"
- * resolves to dark_oak_log rather than oak_log, and "sandstone" no longer
- * matches "stone". Aliases ("wood", "cobble") are tried last.
+ * resolves to dark_oak_log rather than oak_log, and matching is whole-word so
+ * "sandstone" is not "stone". Aliases ("wood", "cobble") are tried last.
  */
 function literalName(request, names) {
     const text = normalizedWords(request);
     if (text.trim() === '' || !names.length) return null;
-    const sorted = [...names].filter((n) => n && n !== 'none').sort((a, b) => b.length - a.length);
+    const sorted = [...new Set(names)].filter((n) => n && n !== 'none').sort((a, b) => b.length - a.length);
     for (const name of sorted) {
         const lower = name.toLowerCase();
         const phrase = lower.replace(/_/g, ' ');
@@ -208,20 +261,22 @@ export class Jev {
         });
         this.getCommand = null;
         this.isAction = () => true;
+        this.mc = null;                          // mindcraft's minecraft-data helpers, when importable
+        this.registry = { blocks: [], items: [] }; // every block and item name the game knows
         this.announced = false;
         this.warnedOtherPrompt = new Set();
-        // Mindcraft truncates history, so the turn carrying a player's message
-        // eventually scrolls out of the window mid-task. Remember who spoke and
-        // what they asked so the task can be finished; both are cleared when
-        // the adapter replies without a command, which ends the task.
+        // The task in flight: what was asked, by whom, and what has happened
+        // since. Kept in code because mindcraft truncates history, so the turn
+        // carrying the request scrolls out of the window mid-task. Cleared
+        // when the adapter replies without a command, which ends the task.
+        this.task = null;
         this.lastSpeaker = null;
-        this.lastRequest = null;
     }
 
     /**
      * Mindcraft's own command declarations, which carry real parameter types
-     * and numeric domains — richer than the rendered COMMAND DOCS, where
-     * BlockName and int are both flattened to "string" and "number".
+     * and numeric domains, and its minecraft-data helpers for the block and
+     * item registries and the recipe graph.
      */
     async loadCommands() {
         if (this.getCommand) return this.getCommand;
@@ -231,6 +286,16 @@ export class Jev {
         // isAction separates world-changing commands from read-only queries,
         // which is what the confidence floor is graded on.
         this.isAction = typeof idx.isAction === 'function' ? idx.isAction : () => true;
+        try {
+            const mc = await import('../utils/mcdata.js');
+            this.mc = mc;
+            this.registry = {
+                blocks: mc.getAllBlocks(['air']).map((b) => b.name),
+                items: mc.getAllItems().map((i) => i.name),
+            };
+        } catch (err) {
+            console.warn('[jev] block/item registry unavailable, using the built-in lists:', err?.message || err);
+        }
         return this.getCommand;
     }
 
@@ -273,11 +338,16 @@ export class Jev {
 
     /**
      * Reply without a command — "Done.", a decline, or an error message — which
-     * ends mindcraft's loop for this request, so forget it.
+     * ends mindcraft's loop for this request, so forget the task.
      */
     finish(reply) {
-        this.lastRequest = null;
+        this.task = null;
         return reply;
+    }
+
+    decline(reason, request) {
+        console.log(`[jev] declining: ${reason}`);
+        return this.finish(request ? "I'm not sure what you want me to do about that." : 'Standing by.');
     }
 
     async sendRequest(turns, systemMessage) {
@@ -293,7 +363,7 @@ export class Jev {
         }
 
         // Debug capture of what the adapter actually receives, for calls that
-        // carry a real player message.
+        // carry a real player message. Replay with src/models/jev_replay.js.
         if (process.env.JEV_DUMP) {
             const fromPlayer = turns.some((t) => t && t.role === 'user' &&
                 typeof t.content === 'string' && PLAYER_LINE.test(t.content.trim()));
@@ -304,21 +374,24 @@ export class Jev {
             }
         }
 
+        const world = parseWorld(system);
         const found = lastUserMessage(turns);
         if (found.speaker) {
             this.lastSpeaker = found.speaker;
-            this.lastRequest = found.text;
+            if (!this.task || this.task.request !== found.text || this.task.speaker !== found.speaker) {
+                this.task = newTask(found.speaker, found.text, world);
+            }
         }
-        const speaker = found.speaker || this.lastSpeaker;
-        const request = found.text || this.lastRequest || '';
-        if (!request) {
+        if (!this.task) {
             // Nothing has been asked: mindcraft's bootstrap turn, or a system
             // event with no task in flight. An empty reply ends the loop
             // quietly and costs no API call.
             return '';
         }
+        const task = this.task;
+        const { request, speaker } = task;
+        updateLedger(task, turns, found.index);
 
-        const world = parseWorld(system);
         // Whoever is talking to the bot is a valid target whether or not they
         // are in render distance: "come to me" is asked precisely when the bot
         // is not beside you.
@@ -326,20 +399,30 @@ export class Jev {
 
         const enabled = parseEnabledCommands(system);
         const specs = this.specsFor(enabled, getCommand);
-        const usable = enabled.filter((name) => specs[name] && !UNSUPPORTED.has(name) &&
-            !SUPPRESSED.has(name) && canFormat(specs[name], world, request));
+        const usable = enabled.filter((name) => specs[name] && !UNSUPPORTED.has(name) && !SUPPRESSED.has(name) &&
+            COMMAND_GROUPS[name] && canFormat(specs[name], world, request));
         if (!this.announced) {
-            const withheld = enabled.filter((n) => UNSUPPORTED.has(n));
-            const suppressed = enabled.filter((n) => SUPPRESSED.has(n));
+            const withheld = enabled.filter((n) => UNSUPPORTED.has(n) || SUPPRESSED.has(n));
+            const ungrouped = enabled.filter((n) => specs[n] && !UNSUPPORTED.has(n) && !SUPPRESSED.has(n) && !COMMAND_GROUPS[n]);
             console.log(`[jev] ${usable.length} commands offered as typed choices` +
-                (withheld.length ? `; ${withheld.length} withheld (need text the model cannot produce): ${withheld.join(' ')}` : '') +
-                (suppressed.length ? `; suppressed: ${suppressed.join(' ')}` : ''));
+                (withheld.length ? `; withheld: ${withheld.join(' ')}` : '') +
+                (ungrouped.length ? `; not in any intent group (never offered): ${ungrouped.join(' ')}` : '') +
+                (this.registry.blocks.length ? `; registry: ${this.registry.blocks.length} blocks, ${this.registry.items.length} items` : '; no registry') +
+                (world.fromSnapshot ? '; world from $WORLD_JSON snapshot' : '; world parsed from prompt text (add $WORLD_JSON to the profile prompt for distances, counts and craftables)'));
             this.announced = true;
         }
         if (usable.length === 0) return this.finish('No commands are available to me right now.');
 
-        const state = buildState(world, request, speaker, turns, found.index);
-        const questions = buildQuestions(usable, specs, world, request);
+        // Completion that code can check needs no model call.
+        const done = codeSatisfied(task, world, this.registry, this.mc);
+        if (done) {
+            console.log(`[jev] "${request}" complete (${done}) — replying without a command`);
+            return this.finish('Done.');
+        }
+
+        const groups = groupUsable(usable);
+        const state = buildState(world, task);
+        const questions = buildQuestions(groups, specs, world, request);
 
         let result;
         try {
@@ -350,42 +433,81 @@ export class Jev {
         }
 
         const answers = result?.answers;
-        if (!answers || !answers.command || typeof answers.command.choice !== 'string') {
+        if (!answers || !answers.intent || typeof answers.intent.choice !== 'string') {
             console.error('[jev] unexpected response shape:', JSON.stringify(result).slice(0, 300));
             return this.finish('My brain disconnected, try again.');
         }
+        const tokens = result.usage?.input_tokens ?? '?';
 
-        // A plain reply with no command is how mindcraft is told to stop.
+        // Fallback completion check: the model's view when code could not decide.
         const satisfied = answers.satisfied?.noul;
         if (typeof satisfied === 'number' && satisfied >= SATISFIED_THRESHOLD) {
-            console.log(`[jev] request satisfied (${satisfied.toFixed(2)}) — replying without a command`);
+            console.log(`[jev] "${request}" judged satisfied (${satisfied.toFixed(2)}) — replying without a command`);
             return this.finish('Done.');
         }
 
-        const picked = answers.command.choice;
-        const confidence = typeof answers.command.confidence === 'number' ? answers.command.confidence : 0;
-        const floor = floorFor(picked, this.isAction);
-        if (!usable.includes(picked)) {
-            console.error(`[jev] model chose ${picked}, which was not offered`);
-            return this.finish("I'm not sure what you want me to do about that.");
+        const intent = answers.intent.choice;
+        const intentConfidence = typeof answers.intent.confidence === 'number' ? answers.intent.confidence : 0;
+        const ranked = rankedLabels(answers.intent.probabilities);
+        if (intent !== 'none' && !groups[intent]) {
+            return this.decline(`intent ${intent} was not offered  [${ranked}]`, request);
         }
-        if (confidence < floor) {
-            // Replying without a command ends mindcraft's loop, so the bot
-            // stops rather than acting on a guess.
-            const ranked = Object.entries(answers.command.probabilities || {})
-                .sort((a, b) => b[1] - a[1]).slice(0, 3)
-                .map(([k, v]) => `${k}=${Number(v).toFixed(2)}`).join(' ');
-            console.log(`[jev] declining: ${picked} at ${confidence.toFixed(2)} is below the ${floor} floor  [${ranked}]`);
-            return this.finish("I'm not sure what you want me to do about that.");
+        if (intentConfidence < INTENT_FLOOR) {
+            return this.decline(`intent ${intent} at ${intentConfidence.toFixed(2)} is below the ${INTENT_FLOOR} floor  [${ranked}]`, request);
+        }
+        if (intent === 'none') {
+            console.log(`[jev] "${request}": nothing to do (${intentConfidence.toFixed(2)})  [${ranked}]  (${tokens} tok)`);
+            return this.finish('');
         }
 
-        const line = formatCommand(specs[picked], answers, world, request, speaker);
+        // Obtaining an item is planned in code from the recipe graph: the model
+        // names the item, code decides whether to collect, smelt or craft next.
+        if (intent === 'make' && this.mc) {
+            const target = resolveItem(request, answers, world, this.registry);
+            const count = explicitCount(request) ?? 1;
+            if (target) {
+                if ((world.inventory[target] || 0) >= count) {
+                    console.log(`[jev] "${request}": already have ${count} ${target}`);
+                    return this.finish('Done.');
+                }
+                const step = nextStepToward(target, count, world, this.mc, new Set(enabled));
+                if (step && repeatsFailure(task, step)) {
+                    console.log(`[jev] planned step ${step} just failed; not repeating it`);
+                    return this.finish("I can't get that from here.");
+                } else if (step) {
+                    console.log(`[jev] make ${count} ${target} (${intentConfidence.toFixed(2)}) -> planned step ${step}  (${tokens} tok)`);
+                    return step;
+                }
+            }
+        }
+
+        const commands = groups[intent];
+        let commandName;
+        let commandConfidence;
+        if (commands.length === 1) {
+            commandName = commands[0];
+            commandConfidence = intentConfidence;
+        } else {
+            const answer = answers[`cmd_${intent}`];
+            commandName = picked(answer, commands);
+            commandConfidence = typeof answer?.confidence === 'number' ? answer.confidence : 0;
+            if (!commandName) return this.decline(`no usable ${intent} command chosen  [${rankedLabels(answer?.probabilities)}]`, request);
+        }
+        const floor = floorFor(commandName, this.isAction);
+        if (commandConfidence < floor) {
+            return this.decline(`${commandName} at ${commandConfidence.toFixed(2)} is below the ${floor} floor  [${rankedLabels(answers[`cmd_${intent}`]?.probabilities)}]`, request);
+        }
+
+        const line = formatCommand(specs[commandName], answers, world, request, speaker, this.registry);
         if (!line) {
-            console.log(`[jev] ${picked} chosen at ${confidence.toFixed(2)} but an argument could not be resolved from "${request}"`);
+            console.log(`[jev] ${commandName} chosen but an argument could not be resolved from "${request}"`);
             return this.finish("I'm not sure which one you mean.");
         }
-        console.log(`[jev] ${picked} conf=${confidence.toFixed(2)}/${floor}` +
-            ` -> ${line}  (${usable.length} options, ${result.usage?.input_tokens ?? '?'} tok)`);
+        if (repeatsFailure(task, line)) {
+            console.log(`[jev] ${line} just failed; not repeating it`);
+            return this.finish("That didn't work.");
+        }
+        console.log(`[jev] ${intent} ${intentConfidence.toFixed(2)} -> ${commandName} ${commandConfidence.toFixed(2)}/${floor} -> ${line}  (${usable.length} options, ${tokens} tok)`);
         return line;
     }
 
@@ -398,19 +520,99 @@ export class Jev {
     }
 }
 
+function rankedLabels(probabilities) {
+    return Object.entries(probabilities || {})
+        .sort((a, b) => b[1] - a[1]).slice(0, 3)
+        .map(([k, v]) => `${k}=${Number(v).toFixed(2)}`).join(' ');
+}
+
 // ---------------------------------------------------------------------------
-// Reading the prompt
+// Reading the world
 // ---------------------------------------------------------------------------
 
+function emptyWorld() {
+    return {
+        fromSnapshot: false,
+        inventory: {},
+        equipment: {},
+        craftable: [],
+        players: [],
+        nearbyPlayers: [],
+        playerDistance: {},
+        blocks: [],
+        blockInfo: {},
+        entities: [],
+        entityCounts: {},
+        entityInfo: {},
+        villagers: [],
+        position: null,
+        health: null,
+        hunger: null,
+        timeOfDay: null,
+        weather: null,
+        biome: null,
+        currentAction: null,
+    };
+}
+
 /**
- * Mindcraft renders state into the system prompt as labelled line lists:
- * STATS, INVENTORY, and — appended to $STATS by the prompter — NEARBY_ENTITIES
- * and NEARBY_BLOCKS. Parsing them back out gives the closed sets the argument
- * questions need. Only the text before COMMAND DOCS is read, so few-shot
- * examples rendered after it can never leak into the world.
+ * The world as the adapter reasons about it. Prefers the JSON snapshot the Jev
+ * profile's prompt carries; falls back to parsing the stock prompt's STATS,
+ * INVENTORY, NEARBY_ENTITIES and NEARBY_BLOCKS text, which has no distances,
+ * counts or craftables.
  */
 function parseWorld(systemMessage) {
-    const full = String(systemMessage || '');
+    const text = String(systemMessage || '');
+    const start = text.indexOf(WORLD_START);
+    const end = text.indexOf(WORLD_END);
+    if (start !== -1 && end > start) {
+        try {
+            return fromSnapshot(JSON.parse(text.slice(start + WORLD_START.length, end).trim()));
+        } catch (err) {
+            console.warn('[jev] world snapshot unreadable, parsing prompt text instead:', err.message);
+        }
+    }
+    return fromPromptText(text);
+}
+
+function fromSnapshot(snap) {
+    const w = emptyWorld();
+    w.fromSnapshot = true;
+    const bot = snap.bot || {};
+    w.position = bot.position || null;
+    w.health = bot.health ?? null;
+    w.hunger = bot.hunger ?? null;
+    w.timeOfDay = bot.time_of_day ?? null;
+    w.weather = bot.weather ?? null;
+    w.biome = bot.biome ?? null;
+    w.currentAction = bot.current_action ?? null;
+    for (const { item, count } of snap.inventory || []) if (item) w.inventory[item] = Number(count) || 0;
+    w.equipment = snap.equipment || {};
+    w.craftable = Array.isArray(snap.craftable) ? snap.craftable.filter((n) => typeof n === 'string') : [];
+    for (const b of snap.nearby_blocks || []) {
+        if (!b?.type || b.type === 'air') continue;
+        w.blocks.push(b.type);
+        w.blockInfo[b.type] = { count: b.count ?? 1, distance: b.distance ?? null };
+    }
+    for (const e of snap.nearby_entities || []) {
+        if (!e?.type) continue;
+        w.entities.push(e.type);
+        w.entityCounts[e.type] = e.count ?? 1;
+        w.entityInfo[e.type] = { distance: e.distance ?? null, hostile: !!e.hostile, huntable: !!e.huntable };
+    }
+    w.villagers = (snap.villagers || []).filter((v) => v && typeof v.id === 'number' && !v.baby)
+        .map((v) => ({ id: v.id, profession: v.profession || 'none', distance: v.distance ?? null }));
+    for (const p of snap.nearby_players || []) {
+        if (!p?.name) continue;
+        w.players.push(p.name);
+        w.playerDistance[p.name] = p.distance ?? null;
+    }
+    w.nearbyPlayers = [...w.players];
+    return w;
+}
+
+function fromPromptText(full) {
+    const w = emptyWorld();
     const docsAt = full.indexOf('*COMMAND DOCS');
     const text = docsAt === -1 ? full : full.slice(0, docsAt);
     const section = (label) => {
@@ -425,62 +627,48 @@ function parseWorld(systemMessage) {
             .map((l) => l.slice(2).trim());
     };
 
-    const inventory = {};
     for (const line of section('INVENTORY')) {
         const m = /^(.+?):\s*(\d+)$/.exec(line);
-        if (m) inventory[m[1].trim()] = Number(m[2]);
+        if (m) w.inventory[m[1].trim()] = Number(m[2]);
     }
-
-    const blocks = new Set();
     for (const line of section('NEARBY_BLOCKS')) {
-        // "oak_log", "water (source)", "Block Below: grass_block",
-        // "First Solid Block Above Head: none"
         const positional = /^(?:Block Below|Block at Legs|Block at Head|First Solid Block Above Head):\s*([a-z_]+)$/.exec(line);
         const name = positional ? positional[1] : line.replace(/\s*\(.*\)$/, '').trim();
-        if (/^[a-z_]+$/.test(name) && name !== 'air' && name !== 'none') blocks.add(name);
+        if (/^[a-z_]+$/.test(name) && name !== 'air' && name !== 'none' && !w.blocks.includes(name)) {
+            w.blocks.push(name);
+            w.blockInfo[name] = { count: null, distance: null };
+        }
     }
-
-    const players = [];
-    const entityCounts = {};
-    const villagers = [];
     for (const line of section('NEARBY_ENTITIES')) {
         const p = /^(?:Human|Bot) player:\s*(.+)$/.exec(line);
-        if (p) { players.push(p[1].trim()); continue; }
-        // "entities: 2 zombie(s)" or
-        // "entities: 3 villager(s) - Adults: (123:farmer), (124:none) - Baby IDs: 130 (babies cannot trade)"
+        if (p) { w.players.push(p[1].trim()); continue; }
         const e = /^entities:\s*(\d+)\s+([a-z_]+)\(s\)(.*)$/.exec(line);
         if (!e) continue;
-        entityCounts[e[2]] = (entityCounts[e[2]] || 0) + Number(e[1]);
+        if (!w.entities.includes(e[2])) w.entities.push(e[2]);
+        w.entityCounts[e[2]] = (w.entityCounts[e[2]] || 0) + Number(e[1]);
+        w.entityInfo[e[2]] = { distance: null, hostile: null, huntable: null };
         if (e[2] === 'villager') {
             for (const v of e[3].matchAll(/\((\d+):([a-z_]+)\)/g)) {
-                villagers.push({ id: Number(v[1]), profession: v[2] });
+                w.villagers.push({ id: Number(v[1]), profession: v[2], distance: null });
             }
         }
     }
-    // STATS also lists nearby players by name; use it when the entity list is missing.
-    if (players.length === 0) {
+    if (w.players.length === 0) {
         const m = /Nearby Human Players:\s*([^\n]+)/.exec(text);
         if (m && !/^none\.?$/i.test(m[1].trim())) {
-            for (const name of m[1].split(',')) if (name.trim()) players.push(name.trim().replace(/\.$/, ''));
+            for (const name of m[1].split(',')) if (name.trim()) w.players.push(name.trim().replace(/\.$/, ''));
         }
     }
-
+    w.nearbyPlayers = [...w.players];
     const position = /Position:\s*x:\s*(-?[\d.]+),\s*y:\s*(-?[\d.]+),\s*z:\s*(-?[\d.]+)/.exec(text);
     const health = /Health:\s*(\d+)\s*\/\s*(\d+)/.exec(text);
     const hunger = /Hunger:\s*(\d+)\s*\/\s*(\d+)/.exec(text);
-
-    return {
-        inventory,
-        nearbyPlayers: [...players],
-        players,
-        blocks: [...blocks],
-        entities: Object.keys(entityCounts),
-        entityCounts,
-        villagers,
-        position: position ? { x: +position[1], y: +position[2], z: +position[3] } : null,
-        health: health ? Number(health[1]) : null,
-        hunger: hunger ? Number(hunger[1]) : null,
-    };
+    const time = /Time:\s*(Morning|Afternoon|Night)/.exec(text);
+    w.position = position ? { x: +position[1], y: +position[2], z: +position[3] } : null;
+    w.health = health ? Number(health[1]) : null;
+    w.hunger = hunger ? Number(hunger[1]) : null;
+    w.timeOfDay = time ? time[1].toLowerCase() : null;
+    return w;
 }
 
 /**
@@ -497,14 +685,15 @@ function parseEnabledCommands(systemMessage) {
     return [...found];
 }
 
+// ---------------------------------------------------------------------------
+// The request and the task ledger
+// ---------------------------------------------------------------------------
+
 /**
- * The last thing an actual player (or another bot) said.
- *
- * Mindcraft re-prompts after every action finishes, so the most recent turn is
- * usually its own output ("Action output: Collected 1 oak_log."), not a
- * request. History gives every speaker other than the bot itself the `user`
- * role and formats the content "Name: text", so require both: system turns
- * such as "INVENTORY: Nothing" look like a speaker line but are not one.
+ * The last thing an actual player (or another bot) said. History gives every
+ * speaker other than the bot itself the `user` role and formats the content
+ * "Name: text"; require both, because system turns such as "INVENTORY:
+ * Nothing" look like a speaker line but are not one.
  */
 const PLAYER_LINE = /^\s*([A-Za-z0-9_]{1,16}):\s+(.+)$/s;
 
@@ -518,28 +707,104 @@ function lastUserMessage(turns) {
     return { speaker: null, text: '', index: -1 };
 }
 
+function newTask(speaker, request, world) {
+    return {
+        speaker,
+        request,
+        startedAt: new Date().toISOString(),
+        inventoryAtStart: { ...world.inventory },
+        events: [],   // { cmd } for a command the bot issued, { out } for what mindcraft reported
+    };
+}
+
+const COMMAND_LINE = /!\w+(?:\([^)]*\))?/;
+
 /**
- * What has happened since the request, as events rather than as instructions:
- * action results, pathfinding failures, the behaviour log. These are what tell
- * the model a job is already done, or that it is stuck.
+ * Everything that happened after the request, as events. While the request is
+ * still in the history window the ledger is rebuilt from it; once it has
+ * scrolled out, new turns are appended after the last event already known.
  */
-function recentEvents(turns, fromIndex, limit = 6) {
-    const events = [];
-    for (let i = turns.length - 1; i > fromIndex && events.length < limit; i--) {
+function updateLedger(task, turns, requestIndex) {
+    const fresh = [];
+    for (let i = requestIndex + 1; i < turns.length; i++) {
         const t = turns[i];
-        if (!t || typeof t.content !== 'string') continue;
+        if (!t || typeof t.content !== 'string' || t.role === 'user') continue;
         const text = t.content.trim();
-        if (!text) continue;
-        if (t.role === 'user') continue;
-        if (text.startsWith('*COMMAND DOCS') || text.includes('You can use the following commands')) continue;
-        if (t.role === 'assistant') { events.push({ bot_did: text.slice(0, 120) }); continue; }
-        events.push({ happened: text.replace(/\s+/g, ' ').slice(0, 200) });
+        if (!text || text.startsWith('*COMMAND DOCS')) continue;
+        if (t.role === 'assistant') {
+            const m = COMMAND_LINE.exec(text);
+            if (m) fresh.push({ cmd: m[0] });
+        } else {
+            fresh.push({ out: text.replace(/^(?:Action|Code) output:\s*/i, '').replace(/\s+/g, ' ').slice(0, 200) });
+        }
     }
-    return events.reverse();
+    if (requestIndex >= 0 || task.events.length === 0) {
+        task.events = fresh;
+        return;
+    }
+    const last = task.events[task.events.length - 1];
+    let start = -1;
+    for (let i = fresh.length - 1; i >= 0; i--) {
+        if (fresh[i].cmd === last.cmd && fresh[i].out === last.out) { start = i; break; }
+    }
+    task.events.push(...fresh.slice(start + 1));
+}
+
+const FAILURE_OUTPUT = /^(Could not|Cannot|Invalid|No |You do not|You don't|You have no|Failed|Error|Unable|Command .* (?:does not exist|was given))/i;
+
+/** The last command issued for the task and whether what followed it reported a failure. */
+function lastAttempt(task) {
+    const { events } = task;
+    let i = events.length - 1;
+    while (i >= 0 && !events[i].cmd) i--;
+    if (i < 0) return null;
+    const outs = events.slice(i + 1).filter((e) => e.out).map((e) => e.out);
+    return { cmd: events[i].cmd, outs, failed: outs.some((o) => FAILURE_OUTPUT.test(o)) };
+}
+
+/** True when `line` is exactly the command that just ran and failed: issuing it again would loop. */
+function repeatsFailure(task, line) {
+    const last = lastAttempt(task);
+    return !!(last && last.failed && last.cmd === line);
+}
+
+/**
+ * Completion that code can check from the ledger and the world, without a
+ * model call. Returns a short reason when the request is done, else null.
+ */
+function codeSatisfied(task, world, registry, mc) {
+    const { request, events } = task;
+    const last = lastAttempt(task);
+    if (!last || last.outs.length === 0) return null;      // nothing run, or it has not reported yet
+    const { outs, failed } = last;
+    const name = /^!\w+/.exec(last.cmd)[0];
+    const groups = COMMAND_GROUPS[name] || [];
+
+    if (name === '!stop' || name === '!stfu') return 'stopped';
+    if (groups.includes('tell')) return 'question answered';
+    if (groups.includes('items') && !failed) return `${name} carried out`;
+    if (groups.includes('move') && outs.some((o) => /You have reached/i.test(o))) return 'arrived';
+    if (name === '!collectBlocks') {
+        const wanted = explicitCount(request);
+        const target = literalName(request, [...registry.blocks, ...Object.keys(COMMON_BLOCKS)]);
+        let collected = 0;
+        for (const e of events) {
+            const m = e.out && /Collected (\d+) ([a-z_]+)/.exec(e.out);
+            if (m && (!target || m[2] === target)) collected += Number(m[1]);
+        }
+        if (wanted) return collected >= wanted ? `collected ${collected}/${wanted}` : null;
+        return collected > 0 && !failed ? `collected ${collected}` : null;
+    }
+    if (groups.includes('make') && mc) {
+        const target = resolveItem(request, {}, world, registry);
+        const count = explicitCount(request) ?? 1;
+        if (target && (world.inventory[target] || 0) >= count) return `have ${count} ${target}`;
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
-// Can this command's arguments be produced at all?
+// Which commands can be formatted at all?
 // ---------------------------------------------------------------------------
 
 /**
@@ -561,7 +826,9 @@ function paramKind(commandName, name, meta) {
         return 'count';
     }
     if (type === 'boolean') return 'boolean';
-    if (type === 'string' && name === 'type') return 'entity';   // !attack, !searchForEntity
+    if (type === 'string' && name === 'type') {
+        return commandName === '!searchForEntity' ? 'entity_type' : 'entity';  // !attack targets what is nearby
+    }
     return 'freetext';
 }
 
@@ -569,12 +836,23 @@ function kindsOf(spec) {
     return spec.params.map(([name, meta]) => paramKind(spec.name, name, meta));
 }
 
+/** Creatures !attack may target: hostile or huntable when the snapshot says so, anything nearby otherwise. */
+function attackable(world) {
+    return world.entities.filter((type) => {
+        const info = world.entityInfo[type];
+        if (!info || info.hostile === null || info.hostile === undefined) return true;
+        return info.hostile || info.huntable;
+    });
+}
+
 function canFormat(spec, world, request) {
     if (!spec) return false;
     for (const kind of kindsOf(spec)) {
         if (kind === 'freetext') return false;
         if (kind === 'player' && world.players.length === 0) return false;
-        if (kind === 'entity' && world.entities.length === 0) return false;
+        if (kind === 'entity' && attackable(world).length === 0) return false;
+        // Searching for a creature is offered only when the request names one.
+        if (kind === 'entity_type' && !literalName(request, [...ENTITY_TYPES, ...world.entities])) return false;
         if (kind === 'villager' && world.villagers.length === 0) return false;
         // A coordinate the player did not type is a guess; do not offer it.
         if (kind === 'coord' && !explicitCoords(request)) return false;
@@ -582,42 +860,76 @@ function canFormat(spec, world, request) {
     return true;
 }
 
+/** The usable commands by intent group; only groups with at least one command. */
+function groupUsable(usable) {
+    const groups = {};
+    for (const name of usable) {
+        for (const intent of COMMAND_GROUPS[name] || []) (groups[intent] ||= []).push(name);
+    }
+    return groups;
+}
+
 // ---------------------------------------------------------------------------
 // Building the questions
 // ---------------------------------------------------------------------------
 
-function buildState(world, request, speaker, turns, requestIndex) {
+function buildState(world, task) {
+    const gained = [];
+    for (const [item, count] of Object.entries(world.inventory)) {
+        const delta = count - (task.inventoryAtStart[item] || 0);
+        if (delta > 0) gained.push({ item, count: delta });
+    }
     return {
-        request,
-        speaker,
+        request: task.request,
+        speaker: task.speaker,
         bot: {
             position: world.position,
             health: world.health,
             hunger: world.hunger,
+            time_of_day: world.timeOfDay,
+            weather: world.weather,
+            biome: world.biome,
+            current_action: world.currentAction,
+            holding: world.equipment.hand ?? null,
         },
         inventory: Object.entries(world.inventory).map(([item, count]) => ({ item, count })),
-        nearby_blocks: world.blocks.slice(0, 30),
-        nearby_entities: Object.entries(world.entityCounts).slice(0, 15).map(([type, count]) => ({ type, count })),
-        nearby_players: world.nearbyPlayers,
-        recent_events: recentEvents(turns, requestIndex),
+        craftable_now: world.craftable.slice(0, 30),
+        nearby_blocks: world.blocks.slice(0, 25).map((type) => ({ type, ...world.blockInfo[type] })),
+        nearby_entities: world.entities.slice(0, 10).map((type) => ({
+            type, count: world.entityCounts[type], ...world.entityInfo[type],
+        })),
+        nearby_players: world.nearbyPlayers.map((name) => ({ name, distance: world.playerDistance[name] ?? null })),
+        task: {
+            commands_run: task.events.filter((e) => e.cmd).slice(-6).map((e) => e.cmd),
+            results: task.events.filter((e) => e.out).slice(-6).map((e) => e.out),
+            inventory_gained_since_request: gained,
+        },
     };
 }
 
-/** The closed set of blocks a BlockName argument may name. */
+/** The closed set of blocks a BlockName argument may name when the request does not name one. */
 function blockCriteria(world) {
     const criteria = {};
-    for (const block of world.blocks) criteria[block] = `The block ${block}, present nearby.`;
+    for (const block of world.blocks) {
+        const info = world.blockInfo[block] || {};
+        criteria[block] = `The block ${block}, present nearby` +
+            (info.distance !== null && info.distance !== undefined ? `, nearest about ${info.distance} blocks away` : '') +
+            (info.count ? `, ${info.count} seen` : '') + '.';
+    }
     for (const [name, description] of Object.entries(COMMON_BLOCKS)) {
         if (!criteria[name]) criteria[name] = `${description} Not in sight, so it would have to be found.`;
     }
     return criteria;
 }
 
-/** The closed set of items an ItemName argument may name. */
+/** The closed set of items an ItemName argument may name when the request does not name one. */
 function itemCriteria(world) {
     const criteria = {};
     for (const [item, count] of Object.entries(world.inventory)) {
         criteria[item] = `The ${item} the bot is carrying (${count}).`;
+    }
+    for (const item of world.craftable.slice(0, 40)) {
+        if (!criteria[item]) criteria[item] = `${item}, which the bot could craft right now.`;
     }
     for (const [name, description] of Object.entries(COMMON_ITEMS)) {
         if (!criteria[name]) criteria[name] = `${description} Not carried; would have to be crafted, found or taken.`;
@@ -625,77 +937,96 @@ function itemCriteria(world) {
     return criteria;
 }
 
-/** The closed set of creatures an entity-type argument may name. */
-function entityCriteria(world) {
+function entityCriteria(world, types) {
     const criteria = {};
-    for (const [type, count] of Object.entries(world.entityCounts)) {
-        criteria[type] = `${count} ${type}${count === 1 ? '' : 's'} nearby.`;
+    for (const type of types) {
+        const count = world.entityCounts[type] || 1;
+        const info = world.entityInfo[type] || {};
+        criteria[type] = `${count} ${type}${count === 1 ? '' : 's'} nearby` +
+            (info.distance !== null && info.distance !== undefined ? `, nearest about ${info.distance} blocks away` : '') +
+            (info.hostile ? ', hostile' : info.huntable ? ', an animal' : '') + '.';
     }
     return criteria;
 }
 
-function buildQuestions(usable, specs, world, request) {
-    const criteria = {};
-    const needed = new Set();
-    for (const name of usable) {
-        const spec = specs[name];
-        for (const kind of kindsOf(spec)) needed.add(kind);
-        const args = spec.params.length
-            ? ` Takes: ${spec.params.map(([p, m]) => `${p} (${m.type})`).join(', ')}.`
-            : '';
-        criteria[name] = `${spec.description}${args}`;
+function buildQuestions(groups, specs, world, request) {
+    const quoted = JSON.stringify(request);
+    const intents = {};
+    for (const intent of Object.keys(INTENTS)) {
+        if (intent === 'none' || groups[intent]) intents[intent] = INTENTS[intent].description;
     }
 
     const questions = {
-        // Mindcraft ends its loop when a reply contains no command. Without a
-        // way to say "done", the adapter emitted a command every single turn
-        // and the agent repeated the same command forever.
+        // Fallback completion check; code decides the cases it can verify
+        // before the model is asked anything.
         satisfied: noul(
-            `A player said to the bot: "${request}". Looking at what the bot has already done in ` +
-            '`recent_events` and the state it is now in, has that request been carried out completely?',
+            `A player said to the bot: ${quoted}. Looking at what the bot has already done in ` +
+            '`task.commands_run`, what those commands reported in `task.results`, and the state the bot is in now, ' +
+            'has that request been carried out completely?',
             {
                 true: 'The request is done; there is nothing further for the bot to do about it.',
                 false: 'Some part of the request is still outstanding, or the bot has not started it.',
             },
         ),
-        command: choice(
-            `A player said to the bot: "${request}". Which single command should the bot run next to serve what they asked for? ` +
-            `Judge by what the bot is carrying, what is nearby, and what has already happened.`,
-            criteria,
+        intent: choice(
+            `A player said to the bot: ${quoted}. What kind of thing are they asking the bot to do next? ` +
+            'Judge by the words used, what the bot is carrying, what is nearby, and what has already happened.',
+            intents,
         ),
     };
 
-    // Speculative arguments. These are answered in parallel with the command
-    // choice and cost no extra round trip; code reads only the ones the chosen
-    // command actually takes, and asks only when a value the request names
-    // outright would not settle it (a single candidate needs no question).
+    // Speculatively, which command within each group. Only groups with more
+    // than one usable command need a question; code reads only the winner.
+    const needed = new Set();
+    for (const [intent, commands] of Object.entries(groups)) {
+        for (const name of commands) for (const kind of kindsOf(specs[name])) needed.add(kind);
+        if (commands.length < 2) continue;
+        const criteria = {};
+        for (const name of commands) {
+            const spec = specs[name];
+            const args = spec.params.length
+                ? ` Takes: ${spec.params.map(([p, m]) => `${p} (${m.type})`).join(', ')}.`
+                : '';
+            criteria[name] = `${spec.description}${args}`;
+        }
+        questions[`cmd_${intent}`] = choice(
+            `Assume the player's request ${quoted} is of this kind: ${INTENTS[intent].description} ` +
+            'Which single command should the bot run next to serve it?',
+            criteria,
+        );
+    }
+
+    // Speculative arguments, asked only when a value the request names outright
+    // would not settle it (a single candidate needs no question).
     if (needed.has('block')) {
         questions.block = choice(
-            `Assume the command the bot runs needs to name a block type. Which block does "${request}" refer to?`,
+            `Assume the command the bot runs needs to name a block type. Which block does ${quoted} refer to?`,
             blockCriteria(world),
         );
     }
     if (needed.has('item')) {
         questions.item = choice(
-            `Assume the command the bot runs needs to name an item. Which item does "${request}" refer to?`,
+            `Assume the command the bot runs needs to name an item. Which item does ${quoted} refer to, or ask for?`,
             itemCriteria(world),
         );
     }
-    if (needed.has('entity') && world.entities.length > 1) {
+    const targets = attackable(world);
+    if (needed.has('entity') && targets.length > 1) {
         questions.entity = choice(
-            `Assume the command names a creature nearby. Which creature does "${request}" refer to?`,
-            entityCriteria(world),
+            `Assume the command attacks a creature nearby. Which creature does ${quoted} refer to?`,
+            entityCriteria(world, targets),
         );
     }
     if (needed.has('player') && world.players.length > 1) {
         const players = {};
         for (const p of world.players) {
+            const d = world.playerDistance[p];
             players[p] = world.nearbyPlayers.includes(p)
-                ? `The player named ${p}, currently nearby.`
+                ? `The player named ${p}, currently nearby${d !== null && d !== undefined ? ` (about ${d} blocks away)` : ''}.`
                 : `The player named ${p}, who is talking to the bot but is not in sight — the bot would have to travel to reach them.`;
         }
         questions.player = choice(
-            `Assume the command names a player. Which player does "${request}" mean? The speaker is usually the answer.`,
+            `Assume the command names a player. Which player does ${quoted} mean? The speaker is usually the answer.`,
             players,
         );
     }
@@ -703,17 +1034,121 @@ function buildQuestions(usable, specs, world, request) {
         const villagers = {};
         for (const v of world.villagers) villagers[String(v.id)] = `The villager with id ${v.id}, a ${v.profession}.`;
         questions.villager = choice(
-            `Assume the command names a villager. Which villager does "${request}" refer to?`,
+            `Assume the command names a villager. Which villager does ${quoted} refer to?`,
             villagers,
         );
     }
     if (needed.has('count') || needed.has('distance') || needed.has('seconds')) {
         questions.amount = choice(
-            `Assume the command takes a quantity. How many does "${request}" ask for?`,
+            `Assume the command takes a quantity. How many does ${quoted} ask for?`,
             AMOUNTS,
         );
     }
     return questions;
+}
+
+// ---------------------------------------------------------------------------
+// Planning in code: the next step toward having an item
+// ---------------------------------------------------------------------------
+
+/** The item a request is about, named outright or chosen by the model. */
+function resolveItem(request, answers, world, registry) {
+    const candidates = Object.keys(itemCriteria(world));
+    return literalName(request, [...registry.items, ...candidates]) ?? picked(answers.item, candidates);
+}
+
+/** A 2x2 hand grid holds four ingredients; anything more needs a crafting table. */
+function needsTable(ingredients) {
+    return Object.values(ingredients).reduce((a, b) => a + b, 0) > 4;
+}
+
+/**
+ * Total base materials still needed to end up with `count` of `item`, walking
+ * the recipe graph and consuming a copy of the inventory along the way.
+ */
+function baseNeeds(item, count, inventory, mc, needs = {}, depth = 0) {
+    const have = inventory[item] || 0;
+    const use = Math.min(have, count);
+    inventory[item] = have - use;
+    count -= use;
+    if (count <= 0 || depth > 6) return needs;
+    const smeltFrom = mc.getItemSmeltingIngredient(item);
+    if (smeltFrom) return baseNeeds(smeltFrom, count, inventory, mc, needs, depth + 1);
+    const recipes = mc.getItemCraftingRecipes(item);
+    if (!recipes || !recipes.length) {
+        needs[item] = (needs[item] || 0) + count;
+        return needs;
+    }
+    const [ingredients, { craftedCount }] = recipes[0];
+    const times = Math.ceil(count / (craftedCount || 1));
+    for (const [ingredient, n] of Object.entries(ingredients)) baseNeeds(ingredient, n * times, inventory, mc, needs, depth + 1);
+    inventory[item] = (inventory[item] || 0) + times * (craftedCount || 1) - count;
+    return needs;
+}
+
+/**
+ * The single next command toward having `count` of `item`: craft it if its
+ * ingredients are in hand, otherwise smelt, craft or collect the first missing
+ * ingredient. A base material is gathered the whole plan's worth at once (the
+ * plan for the target plus a crafting table if one will be needed), so the bot
+ * does not walk to the trees once per plank. Returns null when nothing
+ * applicable is enabled or the item is unobtainable this way.
+ */
+function nextStepToward(item, count, world, mc, enabled) {
+    const plan = baseNeeds(item, count, { ...world.inventory }, mc);
+    const recipes = mc.getItemCraftingRecipes(item);
+    if (recipes && recipes.length && needsTable(recipes[0][0]) && !hasTable(world)) {
+        baseNeeds('crafting_table', 1, { ...world.inventory }, mc, plan);
+    }
+    return stepToward(item, count, world, mc, enabled, plan, 0);
+}
+
+function hasTable(world) {
+    return world.inventory.crafting_table > 0 || world.blocks.includes('crafting_table');
+}
+
+function stepToward(item, count, world, mc, enabled, plan, depth) {
+    const have = world.inventory[item] || 0;
+    if (have >= count || depth > 6) return null;
+    const missing = count - have;
+
+    const smeltFrom = mc.getItemSmeltingIngredient(item);
+    if (smeltFrom) {
+        if ((world.inventory[smeltFrom] || 0) >= missing) {
+            return enabled.has('!smeltItem') ? `!smeltItem(${JSON.stringify(smeltFrom)}, ${missing})` : null;
+        }
+        return stepToward(smeltFrom, missing, world, mc, enabled, plan, depth + 1);
+    }
+
+    const recipes = mc.getItemCraftingRecipes(item);
+    if (recipes && recipes.length) {
+        const [ingredients, { craftedCount }] = recipes[0];
+        const times = Math.ceil(missing / (craftedCount || 1));
+        if (needsTable(ingredients) && !hasTable(world)) {
+            const tableStep = stepToward('crafting_table', 1, world, mc, enabled, plan, depth + 1);
+            if (tableStep) return tableStep;
+        }
+        for (const [ingredient, n] of Object.entries(ingredients)) {
+            if ((world.inventory[ingredient] || 0) < n * times) {
+                return stepToward(ingredient, n * times, world, mc, enabled, plan, depth + 1);
+            }
+        }
+        return enabled.has('!craftRecipe') ? `!craftRecipe(${JSON.stringify(item)}, ${times})` : null;
+    }
+
+    // A base material: collect it from the block that drops it.
+    const total = Math.max(plan[item] || 0, missing);
+    const sources = mc.getItemBlockSources(item);
+    if (sources && sources.length) {
+        const source = sources.find((s) => world.blocks.includes(s)) || sources[0];
+        return enabled.has('!collectBlocks') ? `!collectBlocks(${JSON.stringify(source)}, ${Math.min(total, GATHER_CAP)})` : null;
+    }
+    const animal = mc.getItemAnimalSource(item);
+    if (animal) {
+        if (world.entities.includes(animal) && enabled.has('!attack')) return `!attack(${JSON.stringify(animal)})`;
+        if (enabled.has('!searchForEntity')) return `!searchForEntity(${JSON.stringify(animal)}, ${RANGE_DEFAULT.search_range})`;
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -760,7 +1195,7 @@ function picked(answer, allowed) {
  * be resolved from the request, the world or the model's answers. Exact
  * lookups come first: a value the request names outright is never judged.
  */
-function formatCommand(spec, answers, world, request, speaker) {
+function formatCommand(spec, answers, world, request, speaker, registry) {
     if (!spec.params.length) return spec.name;
 
     const coords = explicitCoords(request);
@@ -773,17 +1208,20 @@ function formatCommand(spec, answers, world, request, speaker) {
         switch (kind) {
             case 'block': {
                 const candidates = Object.keys(blockCriteria(world));
-                value = literalName(request, candidates) ?? picked(answers.block, candidates);
+                value = literalName(request, [...registry.blocks, ...candidates]) ?? picked(answers.block, candidates);
                 break;
             }
-            case 'item': {
-                const candidates = Object.keys(itemCriteria(world));
-                value = literalName(request, candidates) ?? picked(answers.item, candidates);
+            case 'item':
+                value = resolveItem(request, answers, world, registry);
+                break;
+            case 'entity': {
+                const targets = attackable(world);
+                value = literalName(request, targets)
+                    ?? (targets.length === 1 ? targets[0] : picked(answers.entity, targets));
                 break;
             }
-            case 'entity':
-                value = literalName(request, world.entities)
-                    ?? (world.entities.length === 1 ? world.entities[0] : picked(answers.entity, world.entities));
+            case 'entity_type':
+                value = literalName(request, [...ENTITY_TYPES, ...world.entities]);
                 break;
             case 'player':
                 value = literalPlayer(request, world.players)

@@ -1,6 +1,7 @@
 import { readFileSync, mkdirSync, writeFileSync} from 'fs';
 import { Examples } from '../utils/examples.js';
 import { getCommandDocs } from '../agent/commands/index.js';
+import { buildWorldSnapshot } from '../agent/library/world_snapshot.js';
 import { SkillLibrary } from "../agent/library/skill_library.js";
 import { stringifyTurns } from '../utils/text.js';
 import { getCommand } from '../agent/commands/index.js';
@@ -149,6 +150,10 @@ export class Prompter {
         }
         if (prompt.includes('$ACTION')) {
             prompt = prompt.replaceAll('$ACTION', this.agent.actions.currentActionLabel);
+        }
+        if (prompt.includes('$WORLD_JSON')) {
+            // Structured state for adapters that consume the world as data.
+            prompt = prompt.replaceAll('$WORLD_JSON', JSON.stringify(buildWorldSnapshot(this.agent)));
         }
         if (prompt.includes('$COMMAND_DOCS'))
             prompt = prompt.replaceAll('$COMMAND_DOCS', getCommandDocs(this.agent));

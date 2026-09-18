@@ -15,26 +15,30 @@ LLM → "Sure! I'll get that wood for you. !collectBlocks("oak_log", 10)"
       → regex → !collectBlocks("oak_log", 10)
 ```
 
-Jev cannot write that line. Instead `src/models/jev.js` reads the command list
-mindcraft already declares, turns it into a closed choice question, asks Jev
-which command to run and — only where the request is vague — what its arguments
-should be, and formats the call itself:
+Jev cannot write that line. Instead `src/models/jev.js` treats the decision as
+a few small judgments over structured state, and formats the call itself:
 
 ```
-mindcraft's commandList  →  choice question over ~30 command labels
-world state in the prompt →  closed sets for the arguments
-Jev                       →  { command: "!collectBlocks", block: "oak_log", amount: "a_few" }
-code                      →  !collectBlocks("oak_log", 5)
+world snapshot (JSON)        →  state: position, inventory, craftables, blocks and
+                                creatures with distances, the task so far
+mindcraft's command list     →  intent choice (move / gather / make / fight / items /
+                                tell / stop / none) + a command choice per group
+the request's vague words    →  block / item / creature / player / amount choices
+Jev, one round trip          →  { intent: "gather", cmd_gather: "!collectBlocks",
+                                  block: "oak_log", amount: "a_few" }
+code                         →  !collectBlocks("oak_log", 5)
 ```
 
-The command and every argument come back typed and bounded, so the model
-cannot name a command that does not exist or an item outside the offered set.
-The malformed-call failure mode disappears by construction.
+Everything Jev answers is a choice from a closed set or a probability, so the
+model cannot name a command that does not exist or an item outside the offered
+set. The malformed-call failure mode disappears by construction.
 
 Exact values stay in code. `"collect 5 oak logs"` gets its `5` from a regex and
-its `oak_log` from a whole-word match against the candidate set; Jev is
-consulted only for what is genuinely a judgment — which command, and what a
-vague request meant.
+its `oak_log` from a whole-word match against the game's block registry; Jev is
+consulted only for what is genuinely a judgment — what kind of thing is being
+asked, which command within that kind, and what a vague word meant. Obtaining
+an item is not judged at all: the model names the item, and code walks the
+recipe graph to decide whether to collect, smelt or craft next.
 
 ## Setup
 
@@ -53,6 +57,10 @@ Then add `./profiles/jev.json` to `profiles` in `settings.js` and run
 `node main.js`. The adapter refuses to start without a key, like the other
 providers.
 
+The profile overrides `conversing` with a prompt that carries only what the
+adapter reads: the JSON world snapshot (`$WORLD_JSON`) and the command docs.
+None of the prose an LLM would need is rendered, and none is sent to Jev.
+
 **Node 20–22 is required.** Node 18 lacks the global `File` that undici needs;
 Node 24 trips an internal ESM loader assertion in mindcraft's dependency mix.
 
@@ -70,8 +78,8 @@ the adapter.
   `UNSUPPORTED` in `src/models/jev.js`: `!newAction`, `!goal`, `!endGoal`,
   `!startConversation`, `!searchWiki`, `!rememberHere`,
   `!goToRememberedPlace`, `!setMode`, `!useOn` and `!tradeWithVillager`.
-  Anything else whose parameter kind the adapter does not recognise is dropped
-  the same way as a safety net.
+  Anything else whose parameter kind the adapter does not recognise, or that
+  belongs to no intent group, is dropped the same way as a safety net.
 - **No memory summaries.** Mindcraft reuses the chat model to summarise
   history into memory and to decide whether to answer another bot mid-action.
   Neither can be answered with a command, so the adapter answers them in code:
@@ -92,8 +100,18 @@ two reasons distinct.
 
 Mindcraft ends its loop when a reply contains no command. An adapter that
 always emits one can never stop — the first version repeated
-`!lookAtPlayer` indefinitely. So every turn also asks a `satisfied` noul, and
-above 0.6 the adapter replies `"Done."` with no command.
+`!lookAtPlayer` indefinitely.
+
+Completion is decided in code wherever code can check it, from the task ledger
+(see below) and the world, before the model is asked anything: a `!stop` that
+ran; a question answered by a query command; an `items` command that reported
+no failure; a movement command that reported `You have reached`; a collect
+whose `Collected N` outputs add up to the count the player typed (or, with no
+count, one successful collect); an item the bot now holds enough of. Each
+costs no API call.
+
+Everything else falls to a `satisfied` noul asked alongside the intent; above
+0.6 the adapter replies `"Done."` with no command.
 
 ## Finding the request
 
@@ -117,8 +135,13 @@ request goes into the state as `recent_events`, which is also what lets the
 failed and the bot is stuck.
 
 Mindcraft truncates history, so the turn carrying the request eventually
-scrolls out of the window mid-task. The adapter remembers the last request and
-who made it until it replies without a command, which is what ends a task.
+scrolls out of the window mid-task. The adapter keeps the task in code: who
+asked, what they asked, the inventory when they asked, every command issued for
+it and everything mindcraft reported back. While the request is still in the
+window the ledger is rebuilt from history; once it has scrolled out, new turns
+are appended. The ledger is what the completion checks read, and a trimmed
+view of it goes to the model as `task`. It is cleared when the adapter replies
+without a command, which is what ends a task.
 
 ## Naming a player
 
@@ -148,9 +171,10 @@ Each parameter of each command is classified from mindcraft's own declaration
 
 | Kind | Candidates | Exact lookup in the request | Otherwise |
 | --- | --- | --- | --- |
-| block (`BlockName`) | nearby blocks + common materials | whole word or phrase, singular or plural, aliases ("wood") | Jev's `block` choice |
-| item (`ItemName`, `BlockOrItemName`) | inventory + common items | same | Jev's `item` choice |
-| entity (`!attack`, `!searchForEntity`) | creatures actually nearby | same | the only one, else Jev's `entity` choice |
+| block (`BlockName`) | the full block registry for exact names; nearby blocks (with distance and count) + common materials for the model | whole word or phrase, singular or plural, aliases ("wood") | Jev's `block` choice |
+| item (`ItemName`, `BlockOrItemName`) | the full item registry for exact names; inventory + craftable now + common items for the model | same | Jev's `item` choice |
+| creature to attack | hostile or huntable creatures actually nearby | same | the only one, else Jev's `entity` choice |
+| creature to search for (`!searchForEntity`) | common creature types + nearby | same | not offered unless the request names one |
 | player | the speaker + players nearby | the name, whole word | the only one, else Jev's `player` choice, else the speaker |
 | villager id (`!showVillagerTrades`) | ids from the entity list | the id | the only one, else Jev's `villager` choice |
 | coordinates | — | a typed `x, y, z` triple | not offered at all |
@@ -172,12 +196,14 @@ the model cannot pick them.
 
 ## Declining to act
 
-With ~30 commands on offer, probability spreads thin, and a top pick of 0.16 is
-close to a coin flip between several options. Below a floor the adapter declines
-rather than running the top of a flat distribution, replying without a command
-so mindcraft's loop stops and the bot stands still.
+The decision is two-stage: an intent over at most eight options, then a
+command within the winning group. The intent needs 0.35 to act at all. The
+command floor then applies to the group choice (or to the intent itself when
+the group has a single command). Below a floor the adapter declines rather than
+running the top of a flat distribution, replying without a command so
+mindcraft's loop stops and the bot stands still.
 
-The bar rises with consequence:
+The command bar rises with consequence:
 
 | Kind | Floor | Rationale |
 | --- | --- | --- |
@@ -190,8 +216,9 @@ Replayed against every decision logged from early live sessions, this declined
 `!lookAtPlayer` at 0.20 and 0.32 — while leaving all 47 correct decisions
 untouched, including every `!goToPlayer` (0.70-0.99).
 
-These values are calibrated on a small sample and are a starting point, not a
-result. They live in `FLOOR` in `src/models/jev.js`.
+These values were calibrated on a small sample under the earlier flat choice
+and are a starting point, not a result. They live in `INTENT_FLOOR` and `FLOOR`
+in `src/models/jev.js`; re-measure them with the replay script below.
 
 ## Debugging what the model sees
 
@@ -201,7 +228,14 @@ lines:
 
 ```bash
 JEV_DUMP=/tmp/jevprompt.json node main.js
+node src/models/jev_replay.js /tmp/jevprompt.json          # replay every decision
+node src/models/jev_replay.js /tmp/jevprompt.json --grep wood --limit 5
 ```
+
+The replay feeds the captured records through one adapter in order, so the
+task ledger behaves as it does live, and prints each decision with its
+confidences. Floors, group descriptions and the planner should be tuned
+against a replay set, not against remembered sessions.
 
 ## Changes to mindcraft itself
 
@@ -211,13 +245,21 @@ Deliberately small; the adapter is additive.
   existing `static prefix` discovery in `_model_map.js`; no core wiring needed.
 - **`src/models/typesafe_client.js`** (new) — a dependency-free client for
   `POST /v1/systemone`.
-- **`profiles/jev.json`** (new) — the profile.
+- **`src/models/jev_replay.js`** (new) — replays a `JEV_DUMP` capture.
+- **`src/agent/library/world_snapshot.js`** (new) and **`src/models/prompter.js`**
+  — a `$WORLD_JSON` placeholder that renders a structured snapshot of what the
+  bot observes: position, health, hunger, biome, time, weather, current action,
+  modes, inventory, equipment, craftable items, nearby block types with count
+  and nearest distance, nearby creatures with count, distance and hostile or
+  huntable flags, villagers by id, and nearby players with distance. Built
+  from helpers mindcraft already had; only rendered when a prompt asks for it.
+- **`profiles/jev.json`** (new) — the profile, with a `conversing` prompt that
+  carries the snapshot and the command docs and nothing else.
 - **`src/agent/vision/vision_interpreter.js`** — imports `camera.js` lazily,
   and only when `allow_vision` is on. `camera.js` pulls in `node-canvas-webgl`,
-  a native module that some installs cannot load (`ERR_INTERNAL_ASSERTION` from
-  the ESM loader on one machine here); with vision off, which is the default,
-  it is now never imported, so a broken native build cannot take the agent
-  down at startup. Bots with vision on behave exactly as before.
+  a native module that some installs cannot load; with vision off, which is
+  the default, it is now never imported, so a broken native build cannot take
+  the agent down at startup. Bots with vision on behave exactly as before.
 - **`settings.js`** — one commented line offering the Jev profile.
 
 ## Observed behaviour
@@ -243,6 +285,9 @@ shape of a flat distribution rather than a bug; raising the query floor to
 around 0.35 would quieten it while still letting a real "what are you carrying?"
 through at 0.98.
 
-These numbers predate the argument-resolution changes above (which fixed, among
-others, `!digDown` ignoring the typed distance and `!lookAtPlayer` being given
-a number for its direction) and should be re-measured.
+These numbers predate the structured snapshot, the intent decomposition, the
+code-side completion checks and the planner, and should be re-measured with the
+replay script. Expect intent confidence to read higher than the old flat
+command confidence did, since it is spread over at most eight options rather
+than thirty, and expect fewer model calls per task, since completion is mostly
+decided in code.
